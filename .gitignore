@@ -1,0 +1,10 @@
+# per-machine state and secrets
+runs/
+logs/
+.env
+config.json
+jev-findings/
+jev-replay/
+# macOS metadata
+._*
+.DS_Store
