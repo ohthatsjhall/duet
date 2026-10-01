@@ -20,6 +20,23 @@ review = 'You are the INDEPENDENT REVIEWER.' in prompt
 simplify = 'doing the final quality pass' in prompt
 final = p.cwd().name == 'integration'
 log = p(os.environ['DUET_TEST_CALLS'])
+def reply(result):
+    if p(sys.argv[0]).name == 'codex':
+        p(sys.argv[sys.argv.index('-o')+1]).write_text(json.dumps(result)); print(json.dumps({'type':'turn.completed'}))
+    else:
+        print(json.dumps({'subtype':'success','is_error':False,'structured_output':result}))
+if 'SANDBOX PROBE' in prompt:
+    import re
+    if scenario != 'sandbox-blocked':
+        subprocess.run(['sh', re.search(r'sh (\S+probe\.sh)', prompt).group(1)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    reply({'status':'completed','summary':'probe','commits':[],'checks_run':[],'decision_requests':[],'deviations':[]})
+    sys.exit(0)
+if scenario == 'slow-build' and not review and p.cwd().name != 'integration':
+    import time; time.sleep(30)
+if scenario == 'review-crash-once' and review and p(sys.argv[0]).name == 'codex':
+    flag = log.with_name('review-crashed')
+    if not flag.exists():
+        flag.write_text('1'); print(json.dumps({'type':'thread.started','thread_id':'simulated'})); sys.stdout.flush(); os._exit(139)
 with log.open('a') as f:
     f.write(json.dumps({'review':review, 'final':final, 'simplify':simplify, 'prompt':prompt, 'args':sys.argv, 'secret':p('secret.env').exists(), 'bg_disabled':os.environ.get('CLAUDE_CODE_DISABLE_BACKGROUND_TASKS')=='1'})+'\n')
 if review:
@@ -61,6 +78,10 @@ else:
         hook=p(common)/'hooks'/'pre-commit'
         hook.write_text('#!/bin/sh\nexit 1\n'); hook.chmod(0o755)
     result = {'status':'completed','summary':'Fixture built','commits':[], 'checks_run':[], 'decision_requests':[], 'deviations':[]}
+    if scenario == 'environment-blocked' and not final:
+        result['status']='blocked'
+        result['summary']='Sandbox refused to commit or bind ports'
+        result['deviations']=['git could not create index.lock']
     if scenario == 'owner-decision' and not final:
         result['status']='blocked'
         result['summary']='No safe reversible choice exists'
@@ -102,8 +123,8 @@ class DuetCliTests(unittest.TestCase):
                     'PATH':str(self.bin)+os.pathsep+os.environ['PATH'],
                     'DUET_TEST_CALLS':str(self.calls), 'DUET_TEST_SCENARIO':'',
                     'GIT_CONFIG_GLOBAL':os.devnull, 'GIT_CONFIG_NOSYSTEM':'1',
-                    'GIT_TERMINAL_PROMPT':'0'}
-        for key in ('GIT_DIR','GIT_WORK_TREE','GIT_INDEX_FILE','GIT_COMMON_DIR'):
+                    'GIT_TERMINAL_PROMPT':'0', 'DUET_RETRY_DELAY_SECONDS':'0'}
+        for key in ('GIT_DIR','GIT_WORK_TREE','GIT_INDEX_FILE','GIT_COMMON_DIR','TYPESAFE_API_KEY'):
             self.env.pop(key,None)
         self.git('init','-q'); self.git('config','user.email','fixture@example.test')
         self.git('config','user.name','Duet fixture'); self.git('config','commit.gpgsign','false')
@@ -433,6 +454,87 @@ class DuetCliTests(unittest.TestCase):
         self.assertIn('uncommitted files',self.last_output)
         self.assertTrue(marker.exists())
         self.assertEqual(self.git('rev-parse','--verify',self.state['branch']).returncode,0)
+
+    def test_a_blocked_sandbox_stops_before_any_ticket_with_the_fix(self):
+        self.start('sandbox-blocked')
+        self.assertEqual(self.state['phase'],'stopped',self.last_output)
+        self.assertIn('cannot commit',self.state['stopReason'])
+        self.assertIn('danger-full-access',self.state['stopReason'])
+        self.assertFalse(self.calls.exists() and self.records(),'no ticket may build before the probe passes')
+        self.assertEqual(self.state['tickets']['01']['status'],'pending')
+
+    def test_the_probe_passes_and_cleans_up_after_itself(self):
+        writable=self.root/'cache'; writable.mkdir()
+        self.start(writableDirs=[str(writable)])
+        self.assertEqual(self.state['phase'],'done',self.last_output)
+        self.assertIn('preflightAt',self.state)
+        self.assertEqual(list(writable.iterdir()),[])
+        self.assertFalse((self.run_path/'probe').exists())
+
+    def test_unsandboxed_builders_skip_the_probe(self):
+        self.start('sandbox-blocked',builder='claude')
+        self.assertEqual(self.state['phase'],'done',self.last_output)
+        self.assertFalse((self.run_path/'jobs/preflight').exists())
+
+    def test_a_red_baseline_stops_before_any_ticket_unless_allowed(self):
+        self.start(check='test -f behavior.txt')
+        self.assertEqual(self.state['phase'],'stopped',self.last_output)
+        self.assertIn('baseline check is red',self.state['stopReason'])
+        self.assertFalse(self.calls.exists() and self.records())
+        self.cli('resume',self.state['id'],'--allow-red-baseline')
+        self.state=json.loads((self.run_path/'state.json').read_text())
+        self.assertEqual(self.state['phase'],'done',self.last_output)
+
+    def test_a_block_with_nothing_to_choose_is_a_setup_failure_not_a_decision(self):
+        self.start('environment-blocked')
+        self.assertEqual(self.state['phase'],'stopped',self.last_output)
+        self.assertEqual(self.state['decisions'],{})
+        self.assertEqual(self.state['tickets']['01']['status'],'failed')
+        self.assertIn('not a decision',self.state['stopReason'])
+        self.assertIn('index.lock',self.state['stopReason'])
+
+    def test_a_crashed_review_call_is_retried(self):
+        self.start('review-crash-once',builder='claude')
+        self.assertEqual(self.state['phase'],'done',self.last_output)
+        self.assertTrue((self.run_path/'jobs/01/review-1-retry1').exists())
+
+    def _interrupt(self,sig):
+        self.env['DUET_TEST_SCENARIO']='slow-build'
+        (self.repo/'.duet.json').write_text(json.dumps({'check':'true','parallel':1}))
+        proc=subprocess.Popen([BUN,str(SUPERVISOR),'start','--spec',str(self.spec),'--builder','claude'],cwd=self.repo,env=self.env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+        import time
+        for _ in range(100):
+            states=list((self.home/'runs').glob('*/state.json'))
+            if states and json.loads(states[0].read_text())['tickets']['01']['status']=='building': break
+            time.sleep(0.1)
+        os.killpg(proc.pid,sig); proc.wait(timeout=10)
+        self.run_path=states[0].parent
+        self.state=json.loads(states[0].read_text())
+        self.env['DUET_TEST_SCENARIO']=''
+
+    def test_an_interrupted_run_is_recovered(self):
+        self._interrupt(signal.SIGTERM)
+        self.assertEqual(self.state['interrupted'],'SIGTERM')
+        self.cli('recover')
+        self.state=json.loads((self.run_path/'state.json').read_text())
+        self.assertEqual(self.state['phase'],'done',self.last_output)
+        self.assertNotIn('interrupted',self.state)
+
+    def test_ctrl_c_is_the_owner_stopping_and_is_never_recovered(self):
+        self._interrupt(signal.SIGINT)
+        self.assertEqual(self.state['phase'],'stopped')
+        self.cli('recover')
+        self.state=json.loads((self.run_path/'state.json').read_text())
+        self.assertEqual(self.state['phase'],'stopped')
+
+    def test_recovery_gives_up_after_repeated_interruptions(self):
+        self._interrupt(signal.SIGTERM)
+        state=json.loads((self.run_path/'state.json').read_text()); state['recoveries']=3
+        (self.run_path/'state.json').write_text(json.dumps(state))
+        self.cli('recover')
+        self.state=json.loads((self.run_path/'state.json').read_text())
+        self.assertEqual(self.state['phase'],'stopped')
+        self.assertIn('not resuming automatically',self.state['stopReason'])
 
 if __name__=='__main__':
     unittest.main(verbosity=2)

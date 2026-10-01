@@ -19,7 +19,7 @@ with no human relaying between Claude Code and Codex.
         artifacts/<ticket>/  what the ticket produced but did not commit, kept before its
                              worktree is deleted (see `artifacts` in the repo config)
     ~/.local/bin/duet        shim
-    ~/.agents/skills/duet    the /duet skill, symlinked into ~/.claude/skills and ~/.codex/skills
+    ~/.duet/skill/           the /duet skill; ~/.agents/skills/duet links here, ~/.claude/skills/duet links to that
 
 ## Flow
 
@@ -186,6 +186,24 @@ preserve that state explicitly rather than deleting around the guard.
   attempt numbers; retrying simplify preserves the earlier attempt logs.
 - A failed or blocked final simplify/fix stops the run and preserves partial work. A successful
   agent process alone is insufficient: its structured result must also report completion.
+- Before any ticket, a preflight proves the setup: a codex builder in a sandbox runs a probe through
+  the exact builder command (commit, bind a local port, write each `writableDirs` entry), verified
+  from git and the filesystem rather than its reply; then the baseline check must be green. Either
+  failure stops the run in minutes with the fix, instead of hours in. `--allow-red-baseline` on
+  start or resume overrides the baseline gate. Claude builders and `danger-full-access` skip the probe.
+- A builder that stops with no alternatives to choose between hit its environment, not a product
+  question: the ticket fails with its diagnostics (fix the setup, `duet resume <id> --retry-failed`)
+  rather than raising a decision with no options. With a Jev key, each real decision is annotated
+  with Jev's probability that it is genuinely the owner's call; recorded only.
+- An agent call that fails as a process (crash, API error, unparseable output) is retried twice,
+  60s apart, before it costs a ticket; a ticket build retry is told to continue its partial work.
+  Timeouts are not retried. `DUET_RETRY_DELAY_SECONDS` overrides the delay.
+- A supervisor ended by SIGTERM (reboot, service stop), SIGHUP (dropped ssh) or a crash is marked
+  `interrupted`; `duet recover`, run by the `duet-recover` systemd user timer after boot and every
+  10 minutes, resumes it — at most 3 times in a row before stopping for the owner. Ctrl-C stops the
+  run as the owner's choice, and a SIGKILL (a caller's time limit) records nothing: neither is resumed.
+  Timer: `~/.config/systemd/user/duet-recover.{service,timer}`, PATH from `~/.config/duet.env`;
+  logs: `journalctl --user -u duet-recover`.
 - Every transition is saved; `duet resume <id>` continues after a crash, stop, or answered decision.
   A resume re-reads `.duet.json` for the check, writable dirs, sandbox, models, timeout and
   builder instructions, so a config fix applies to the run that needed it. Add `--retry-failed`
@@ -215,6 +233,7 @@ Set `DUET_UNDER_TEST` to an alternate supervisor path to test a staged copy.
 The tests cover advisory and strict ticket review policies, carried-finding reconciliation,
 the blocking final gate, genuine owner decisions, retry limits, independent review instructions,
 commit/verification integrity, failed final passes, resume behavior, explicit model plans,
+the sandbox probe and baseline gate, setup failures versus decisions, call retries, interrupt recovery,
 successful completion with both agent adapters, and guarded teardown.
 
 A run in `stopped` state has paused its own automation. It does not stop application
