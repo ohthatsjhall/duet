@@ -607,6 +607,10 @@ async function callAgent(c: AgentCall): Promise<AgentResult> {
 
   const env: Record<string, string> = { ...process.env } as Record<string, string>;
   delete env.CLAUDECODE; // allow nesting when the supervisor itself is launched from inside Claude Code
+  // Agents bill their own logins (Claude/ChatGPT subscriptions). An API key inherited from the shell, or
+  // from a .env/.env.local that Bun auto-loads from the working directory, would silently switch
+  // \`claude -p\` and \`codex exec\` to per-token API billing.
+  for (const k of ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "CODEX_API_KEY"]) delete env[k];
   // Headless \`claude -p\` with a required JSON result ends the job when a turn ends. A builder that starts
   // background subagents (\`/simplify\` starts four) and yields to wait for them is forced to report its
   // unfinished work as failed. Foreground subagents keep the turn open until their results are in.
@@ -914,7 +918,7 @@ async function ticketPipeline(run: Run, t: Ticket): Promise<void> {
     stopWorktreeProcesses(run, wt);
     // commit leftovers the builder forgot, so the reviewed head is the whole tree
     if ((await gitTry(wt, "status", "--porcelain")).out) {
-      await git(wt, "add", "-A"); await git(wt, "commit", "-q", "--no-verify", "-m", `duet: commit uncommitted builder changes (attempt ${t.attempts})`);
+      await git(wt, "add", "-A"); await git(wt, "commit", "-q", "-m", `chore: commit uncommitted builder changes (attempt ${t.attempts})`);
     }
     if (existsSync(join(wt, ".git", "MERGE_HEAD")) || (await gitTry(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD")).code === 0) {
       t.status = "failed"; t.note = "merge left unresolved"; save(run); log(run, `ticket ${t.id} FAILED: merge left unresolved`); return;
@@ -1119,7 +1123,7 @@ async function finishFinalBuild(run: Run, result: AgentResult, label: string): P
     stopWorktreeProcesses(run, iw);
     if ((await git(iw, "status", "--porcelain")).out) {
       await git(iw, "add", "-A");
-      await git(iw, "commit", "-q", "--no-verify", "-m", `duet: commit uncommitted ${label} changes`);
+      await git(iw, "commit", "-q", "-m", `chore: commit uncommitted ${label} changes`);
     }
     run.integrationHead = await cleanHead(iw);
     if (!result.ok) throw new Error(`${label} call failed: ${result.error}`);

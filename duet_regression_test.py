@@ -38,7 +38,7 @@ if scenario == 'review-crash-once' and review and p(sys.argv[0]).name == 'codex'
     if not flag.exists():
         flag.write_text('1'); print(json.dumps({'type':'thread.started','thread_id':'simulated'})); sys.stdout.flush(); os._exit(139)
 with log.open('a') as f:
-    f.write(json.dumps({'review':review, 'final':final, 'simplify':simplify, 'prompt':prompt, 'args':sys.argv, 'secret':p('secret.env').exists(), 'bg_disabled':os.environ.get('CLAUDE_CODE_DISABLE_BACKGROUND_TASKS')=='1'})+'\n')
+    f.write(json.dumps({'review':review, 'final':final, 'simplify':simplify, 'prompt':prompt, 'args':sys.argv, 'secret':p('secret.env').exists(), 'bg_disabled':os.environ.get('CLAUDE_CODE_DISABLE_BACKGROUND_TASKS')=='1', 'api_keys':[k for k in ('ANTHROPIC_API_KEY','ANTHROPIC_AUTH_TOKEN','OPENAI_API_KEY','CODEX_API_KEY') if k in os.environ]})+'\n')
 if review:
     result = {'verdict':'APPROVED','summary':'Acceptance inspected','findings':[], 'coverage':['fixture acceptance'], 'limitations':[]}
     if scenario == 'empty-revise': result['verdict'] = 'REVISE'
@@ -166,6 +166,16 @@ class DuetCliTests(unittest.TestCase):
 
     def records(self):
         return [json.loads(line) for line in self.calls.read_text().splitlines()]
+
+    def test_agents_never_inherit_api_keys_from_shell_or_dotenv(self):
+        self.env['ANTHROPIC_API_KEY']='sk-ant-shell'; self.env['OPENAI_API_KEY']='sk-shell'
+        (self.repo/'.env.local').write_text('ANTHROPIC_AUTH_TOKEN=dotenv\nCODEX_API_KEY=dotenv\n')
+        with open(self.repo/'.git/info/exclude','a') as f: f.write('.env.local\n')
+        for builder in ('claude','codex'):
+            self.start(builder=builder)
+            self.assertTrue(self.records(),self.last_output)
+            self.assertEqual([r['api_keys'] for r in self.records() if r['api_keys']],[],self.last_output)
+            shutil.rmtree(self.home/'runs'); self.calls.unlink()
 
     def test_blocking_ticket_review_policy_preserves_strict_gate(self):
         self.start('empty-revise',ticketReviewPolicy='blocking')
