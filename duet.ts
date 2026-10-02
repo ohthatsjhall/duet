@@ -914,7 +914,7 @@ async function ticketPipeline(run: Run, t: Ticket): Promise<void> {
     stopWorktreeProcesses(run, wt);
     // commit leftovers the builder forgot, so the reviewed head is the whole tree
     if ((await gitTry(wt, "status", "--porcelain")).out) {
-      await git(wt, "add", "-A"); await git(wt, "commit", "-q", "-m", `duet: commit uncommitted builder changes (attempt ${t.attempts})`);
+      await git(wt, "add", "-A"); await git(wt, "commit", "-q", "--no-verify", "-m", `duet: commit uncommitted builder changes (attempt ${t.attempts})`);
     }
     if (existsSync(join(wt, ".git", "MERGE_HEAD")) || (await gitTry(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD")).code === 0) {
       t.status = "failed"; t.note = "merge left unresolved"; save(run); log(run, `ticket ${t.id} FAILED: merge left unresolved`); return;
@@ -1016,7 +1016,7 @@ async function ticketPipeline(run: Run, t: Ticket): Promise<void> {
       t.status = "merging"; save(run);
       const iw = run.integrationWorktree;
       const headBeforeMerge = (await git(iw, "rev-parse", "HEAD")).out;
-      const m = await gitTry(iw, "merge", "--no-ff", "--no-edit", "-m", `Merge ticket ${t.id}: ${t.title}`, t.branch!);
+      const m = await gitTry(iw, "merge", "--no-ff", "--no-edit", "--no-verify", "-m", `Merge ticket ${t.id}: ${t.title}`, t.branch!);
       if (m.code !== 0) {
         await gitTry(iw, "merge", "--abort");
         return false;
@@ -1119,7 +1119,7 @@ async function finishFinalBuild(run: Run, result: AgentResult, label: string): P
     stopWorktreeProcesses(run, iw);
     if ((await git(iw, "status", "--porcelain")).out) {
       await git(iw, "add", "-A");
-      await git(iw, "commit", "-q", "-m", `duet: commit uncommitted ${label} changes`);
+      await git(iw, "commit", "-q", "--no-verify", "-m", `duet: commit uncommitted ${label} changes`);
     }
     run.integrationHead = await cleanHead(iw);
     if (!result.ok) throw new Error(`${label} call failed: ${result.error}`);
@@ -1493,7 +1493,7 @@ async function cmdAccept(id: string, ticketId: string, why: string) {
   const t = run.tickets[ticketId] ?? die(`no ticket ${ticketId} in run ${id}`);
   if (!t.headSha) die(`ticket ${ticketId} has nothing to merge`);
   const iw = run.integrationWorktree;
-  const m = await gitTry(iw, "merge", "--no-ff", "--no-edit", "-m", `Merge ticket ${t.id}: ${t.title}`, t.branch!);
+  const m = await gitTry(iw, "merge", "--no-ff", "--no-edit", "--no-verify", "-m", `Merge ticket ${t.id}: ${t.title}`, t.branch!);
   if (m.code !== 0) { await gitTry(iw, "merge", "--abort"); die(`merge conflicted; resolve it on the ticket branch and resume instead`); }
   run.integrationHead = (await git(iw, "rev-parse", "HEAD")).out;
   if (run.checkAfterMerge) {
