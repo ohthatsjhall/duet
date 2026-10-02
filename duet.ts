@@ -1411,7 +1411,7 @@ async function cmdStart(flags: Record<string, string | boolean>, dryRun = false)
   mkdirSync(join(dir, "decisions"), { recursive: true });
   cpSync(specPath, join(inputsDir, "spec.md"));
   for (const t of tickets) { t.snapshot = join(inputsDir, "issues", basename(t.source)); cpSync(t.source, t.snapshot); }
-  for (const extra of ["CONTEXT.md", "CONTEXT-MAP.md"]) if (existsSync(join(repo, extra))) cpSync(join(repo, extra), join(inputsDir, extra));
+  for (const extra of ["CONTEXT.md", "CONTEXT-MAP.md", "GLOSSARY.md"]) if (existsSync(join(repo, extra))) cpSync(join(repo, extra), join(inputsDir, extra));
 
   const branch = `duet/${slug}-${id.slice(-4)}`;
   const integrationWorktree = join(dir, "integration");
@@ -1542,15 +1542,25 @@ function cmdAnswer(id: string, decisionId: string, answer: string) {
   console.log(`recorded. resume with: duet resume ${id}`);
 }
 
-function printStatus(run: Run) {
+function printStatus(run: Run, quick = false) {
+  const all = Object.values(run.tickets).sort((a, b) => a.num - b.num);
+  if (quick) {
+    for (const t of all.filter((t) => !["pending", "merged", "skipped"].includes(t.status))) console.log(`${t.id} ${t.status}  ${t.title}${t.round ? ` (round ${t.round})` : ""}`);
+    console.log(`${all.filter((t) => t.status === "merged").length}/${all.length} merged${run.stopReason ? `  stopped: ${run.stopReason}` : ""}`);
+    return;
+  }
   console.log(`\nrun ${run.id}  phase=${run.phase}${run.phase === "final" ? `/${run.finalStep}` : ""}  branch=${run.branch}@${short(run.integrationHead)}  builder=${run.builder} reviewer=${run.reviewer}`);
-  for (const t of Object.values(run.tickets).sort((a, b) => a.num - b.num)) {
+  const showRound = all.some((t) => t.round);
+  const rows = all.map((t) => {
     const carried = t.carriedReview
       ? `${blocking(t.carriedReview.findings).length} blocking/${t.carriedReview.findings.length} total finding(s) carried`
       : "";
-    const extra = t.status === "merged" ? [short(t.mergedSha), carried].filter(Boolean).join(", ") : t.status === "needs_decision" ? t.decisions.filter((d) => !run.decisions[d].answer).join(",") : t.status === "failed" ? t.note ?? "" : t.round ? `round ${t.round}` : "";
-    console.log(`  ${t.id}  ${t.status.padEnd(14)} ${t.title}${t.builder ? ` [${t.builder}]` : ""}${extra ? `  (${extra})` : ""}`);
-  }
+    const extra = t.status === "merged" ? [short(t.mergedSha), carried].filter(Boolean).join(", ") : t.status === "needs_decision" ? t.decisions.filter((d) => !run.decisions[d].answer).join(",") : t.status === "failed" ? t.note ?? "" : "";
+    return [String(t.id), t.status, ...(showRound ? [t.round ? String(t.round) : ""] : []), `${t.title}${t.builder ? ` [${t.builder}]` : ""}${extra ? `  (${extra})` : ""}`];
+  });
+  const head = ["#", "state", ...(showRound ? ["round"] : []), "title"];
+  const w = head.map((h, i) => Math.max(h.length, ...rows.map((r) => r[i].length)));
+  for (const r of [head, ...rows]) console.log("  " + r.map((c, i) => (i < r.length - 1 ? c.padEnd(w[i]) : c)).join("  "));
   const open = Object.values(run.decisions).filter((d) => !d.answer);
   if (open.length) { console.log(`\n  decisions waiting:`); for (const d of open) console.log(`    ${d.id} ${d.title}  → duet answer ${run.id} ${d.id} "..."  (${join(runDir(run), "decisions", d.id + ".md")})`); }
   if (run.stopReason) console.log(`\n  stopped: ${run.stopReason}\n  resume with: duet resume ${run.id}`);
@@ -1701,7 +1711,7 @@ async function main() {
     case "start": return cmdStart(flags);
     case "plan": return cmdStart(flags, true);
     case "resume": return cmdResume(pos[0] ?? die("usage: duet resume <run-id> [--retry-failed]"));
-    case "status": return printStatus(loadRun(pos[0] ?? latestRunId()));
+    case "status": return printStatus(loadRun(pos[0] ?? (typeof flags.quick === "string" ? flags.quick : latestRunId())), Boolean(flags.quick));
     case "answer": return cmdAnswer(pos[0] ?? die("usage: duet answer <run-id> <decision-id> \"<answer>\""), pos[1] ?? die("missing decision id"), pos.slice(2).join(" ") || die("missing answer text"));
     case "accept": return cmdAccept(pos[0] ?? die("usage: duet accept <run-id> <ticket-id> \"<why>\""), pos[1] ?? die("missing ticket id"), pos.slice(2).join(" ") || die("missing reason"));
     case "drop": return cmdDrop(pos[0] ?? die("usage: duet drop <run-id> <ticket-id> \"<why>\""), pos[1] ?? die("missing ticket id"), pos.slice(2).join(" ") || die("missing reason"));
@@ -1719,7 +1729,7 @@ async function main() {
   duet resume <run-id> [--retry-failed] [--allow-red-baseline]
                                           continue after a stop, a crash, or an answered decision
   duet recover                             resume runs interrupted by a reboot, hangup or crash (run by the duet-recover timer)
-  duet status [run-id]
+  duet status [run-id] [--quick]          ticket table; --quick: one line for the current ticket(s) + merged count
   duet answer <run-id> <decision-id> "<answer>"
   duet teardown <run-id>                   clean a completed run; retain its integration branch and audit record
   duet runs
