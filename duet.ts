@@ -1616,7 +1616,11 @@ async function cmdResume(id: string, auto = false) {
     if (t.status === "needs_decision" && t.decisions.every((d) => run.decisions[d].answer)) t.status = "pending";
     if (t.status === "failed" && String(process.argv).includes("--retry-failed")) { t.status = "pending"; t.note = undefined; }
   }
-  if (run.phase === "stopped") run.phase = Object.values(run.tickets).every((t) => ["merged", "skipped"].includes(t.status)) ? "final" : "tickets";
+  if (run.phase === "stopped") {
+    run.phase = Object.values(run.tickets).every((t) => ["merged", "skipped"].includes(t.status)) ? "final" : "tickets";
+    // Carried blockers (an owner's `duet carry`, or a run stopped before its final phase began) are reconciled before simplify.
+    if (run.phase === "final" && run.finalStep === "simplify" && carriedReviewContext(run, true).length) run.finalStep = "reconcile";
+  }
   run.stopReason = undefined;
   save(run);
   log(run, `resumed run ${id}`);
@@ -1656,6 +1660,27 @@ async function cmdAccept(id: string, ticketId: string, why: string) {
   appendComment(t.source, `owner accepted ticket ${t.id} over an unresolved review and merged ${short(t.headSha)} as ${short(t.mergedSha)}. Findings left open: ${open}. Reason: ${why}`);
   log(run, `ticket ${t.id} ACCEPTED by the owner and merged as ${short(t.mergedSha)} (open findings: ${open})`);
   console.log(`merged. resume with: duet resume ${id}`);
+}
+
+// An owner finding on a merged ticket, carried as high: final reconciliation must fix it on the combined
+// tree and the final review re-checks it. Only while no supervisor drives the run, which would overwrite it.
+function cmdCarry(id: string, ticketId: string, path: string, problem: string, fix: string) {
+  const run = loadRun(id);
+  const lock = join(runDir(run), "supervisor.pid");
+  const held = existsSync(lock) ? Number(readFileSync(lock, "utf8").trim()) : 0;
+  if (held) {
+    try { process.kill(held, 0); die(`run ${id} is being driven by pid ${held}; carry findings while it is stopped`); }
+    catch (e) { if ((e as NodeJS.ErrnoException).code === "EPERM") die(`run ${id} is being driven by pid ${held}`); }
+  }
+  const t = run.tickets[ticketId] ?? die(`no ticket ${ticketId} in run ${id}`);
+  if (t.status !== "merged") die(`ticket ${ticketId} is ${t.status}; owner findings go on merged tickets`);
+  const base = t.carriedReview ?? { verdict: "APPROVED" as const, summary: "", coverage: [], limitations: [], findings: [], ...t.lastReview, round: t.round };
+  const fid = `OWNER-${base.findings.filter((f) => f.id.startsWith("OWNER-")).length + 1}`;
+  t.carriedReview = { ...base, findings: [...base.findings, { id: fid, severity: "high", axis: "owner", path, evidence: problem, fix }] };
+  save(run);
+  appendComment(t.source, `owner carried ${fid} to final reconciliation: ${problem} → ${fix}`);
+  log(run, `ticket ${t.id}: owner carried ${fid} to final reconciliation`);
+  console.log(`carried ${fid} on ticket ${t.id}. resume with: duet resume ${id}`);
 }
 
 function cmdDrop(id: string, ticketId: string, why: string) {
@@ -1855,6 +1880,7 @@ async function main() {
     case "status": return printStatus(loadRun(pos[0] ?? (typeof flags.quick === "string" ? flags.quick : latestRunId())), Boolean(flags.quick));
     case "answer": return cmdAnswer(pos[0] ?? die("usage: duet answer <run-id> <decision-id> \"<answer>\""), pos[1] ?? die("missing decision id"), pos.slice(2).join(" ") || die("missing answer text"));
     case "accept": return cmdAccept(pos[0] ?? die("usage: duet accept <run-id> <ticket-id> \"<why>\""), pos[1] ?? die("missing ticket id"), pos.slice(2).join(" ") || die("missing reason"));
+    case "carry": return cmdCarry(pos[0] ?? die("usage: duet carry <run-id> <ticket-id> <path> \"<problem>\" \"<fix>\""), pos[1] ?? die("missing ticket id"), pos[2] ?? die("missing path"), pos[3] ?? die("missing problem"), pos[4] ?? die("missing fix"));
     case "drop": return cmdDrop(pos[0] ?? die("usage: duet drop <run-id> <ticket-id> \"<why>\""), pos[1] ?? die("missing ticket id"), pos.slice(2).join(" ") || die("missing reason"));
     case "teardown": return cmdTeardown(pos[0] ?? die("usage: duet teardown <run-id>"));
     case "runs": return cmdRuns();
@@ -1876,6 +1902,8 @@ It is pinned at start; duet labels each issue duet:*, comments each outcome, and
   duet recover                             resume runs interrupted by a reboot, hangup or crash (run by the duet-recover timer)
   duet status [run-id] [--quick]          ticket table; --quick: one line for the current ticket(s) + merged count
   duet answer <run-id> <decision-id> "<answer>"
+  duet carry  <run-id> <ticket-id> <path> "<problem>" "<fix>"
+                                          owner finding on a merged ticket, fixed in final reconciliation
   duet teardown <run-id>                   clean a completed run; retain its integration branch and audit record
   duet runs
   duet doctor

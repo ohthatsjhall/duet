@@ -82,7 +82,7 @@ else:
         hook=p(common)/'hooks'/'pre-commit'
         hook.write_text('#!/bin/sh\nexit 1\n'); hook.chmod(0o755)
     result = {'status':'completed','summary':'Fixture built','commits':[], 'checks_run':[], 'decision_requests':[], 'deviations':[]}
-    if scenario == 'environment-blocked' and not final:
+    if (scenario == 'environment-blocked' or (scenario == 'environment-blocked-02' and p.cwd().name == '02')) and not final:
         result['status']='blocked'
         result['summary']='Sandbox refused to commit or bind ports'
         result['deviations']=['git could not create index.lock']
@@ -598,6 +598,23 @@ class DuetCliTests(unittest.TestCase):
         self.assertEqual(self.state['tickets']['01']['status'],'failed')
         self.assertIn('not a decision',self.state['stopReason'])
         self.assertIn('index.lock',self.state['stopReason'])
+
+    def test_an_owner_finding_on_a_merged_ticket_reaches_final_reconciliation(self):
+        (self.feature/'issues/02-env.md').write_text('# 02: Env\n\n**Blocked by:** None\n\n**Status:** ready-for-agent\n\n- [ ] env.\n')
+        self.start('environment-blocked-02')
+        self.assertEqual(self.state['tickets']['01']['status'],'merged',self.last_output)
+        self.assertEqual(self.state['phase'],'stopped',self.last_output)
+        refused=self.cli('carry',self.state['id'],'02','x','p','f')
+        self.assertNotEqual(refused.returncode,0)
+        carried=self.cli('carry',self.state['id'],'01','behavior.txt','Errors are mapped per route','One shared error layer')
+        self.assertEqual(carried.returncode,0,self.last_output)
+        self.assertEqual(self.cli('drop',self.state['id'],'02','fixture').returncode,0,self.last_output)
+        self.env['DUET_TEST_SCENARIO']=''
+        self.cli('resume',self.state['id'])
+        state=json.loads((self.run_path/'state.json').read_text())
+        self.assertEqual(state['phase'],'done',self.last_output)
+        builds=[r for r in self.records() if r['final'] and not r['review'] and not r['simplify']]
+        self.assertTrue(any('OWNER-1' in r['prompt'] and 'One shared error layer' in r['prompt'] for r in builds), 'reconcile never saw the owner finding')
 
     def test_a_crashed_review_call_is_retried(self):
         self.start('review-crash-once',builder='claude')
