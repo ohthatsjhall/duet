@@ -727,8 +727,12 @@ async function callAgent(c: AgentCall): Promise<AgentResult> {
       cmd.push("--permission-mode", "bypassPermissions");
       for (const d of [c.run.inputsDir, ...(c.run.writableDirs ?? []), ...(c.extraWritableDirs ?? [])]) cmd.push("--add-dir", d);
     } else {
+      // Reviewers write `git -C <dir> diff` and `git --no-pager log` as often as `git diff`; prefix rules alone
+      // denied those, so most reviews ran without git. Each form is allowed per read-only subcommand only.
+      const readOnlyGit = ["diff", "log", "show", "status", "ls-files", "blame"].flatMap((s) =>
+        [`Bash(git ${s}:*)`, `Bash(git -C * ${s} *)`, `Bash(git --no-pager ${s} *)`, `Bash(git -C * --no-pager ${s} *)`, `Bash(git --no-pager -C * ${s} *)`]);
       cmd.push("--permission-mode", "dontAsk",
-        "--allowedTools", "Read", "Glob", "Grep", "LS", "Skill", "Agent", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)", "Bash(git status:*)", "Bash(git ls-files:*)", "Bash(git blame:*)", "Bash(cat:*)", "Bash(rg:*)", "Bash(grep:*)",
+        "--allowedTools", "Read", "Glob", "Grep", "LS", "Skill", "Agent", ...readOnlyGit, "Bash(cat:*)", "Bash(rg:*)", "Bash(grep:*)",
         "--disallowedTools", "Edit", "Write", "MultiEdit", "NotebookEdit",
         "--add-dir", c.run.inputsDir);
     }

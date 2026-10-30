@@ -458,6 +458,14 @@ class DuetCliTests(unittest.TestCase):
         self.assertEqual(events.count('hit a usage limit'),3,events)
         self.assertNotIn('retry 1/2',events)
 
+    def test_claude_reviewers_may_run_read_only_git_in_every_common_form(self):
+        self.start(builder='codex')
+        review=[r for r in self.records() if r['review']][0]['args']
+        for rule in ('Bash(git diff:*)','Bash(git -C * diff *)','Bash(git --no-pager log *)','Bash(git -C * --no-pager show *)'):
+            self.assertIn(rule, review)
+        self.assertFalse([a for a in review if a.startswith('Bash(git -C') and not any(f' {s} ' in a for s in ('diff','log','show','status','ls-files','blame'))], review)
+        self.assertNotIn('Bash(git commit:*)', review)
+
     def test_plan_reads_a_github_spec_and_its_blocked_by_graph(self):
         spike=gh_issue(6,'Spike'); spike['labels']=[{'name':'ready-for-human'}]
         self.github_spec([gh_issue(3,'Tooling'),gh_issue(4,'Markets'),gh_issue(5,'Done already',state='closed'),spike],
