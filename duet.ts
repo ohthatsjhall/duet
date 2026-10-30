@@ -796,13 +796,27 @@ async function callAgent(c: AgentCall): Promise<AgentResult> {
  * that may have left partial work be told to continue it rather than start fresh.
  */
 const RETRIES = 2;
+// Usage and rate limits pass with time, so they wait and never spend the retry budget or fail a ticket.
+const LIMIT_RE = /usage limit|hit your limit|rate.?limit|usage_limit|\b429\b/i;
+const LIMIT_MAX_WAIT_S = 24 * 3600;
+function limitDelay(error: string): number {
+  const fallback = Number(process.env.DUET_LIMIT_DELAY_SECONDS ?? 900);
+  const reset = Number(error.match(/\|(\d{10})\b/)?.[1]); // claude: "usage limit reached|<epoch seconds>"
+  return reset ? Math.min(Math.max(reset - Date.now() / 1000 + 60, fallback), 6 * 3600) : fallback;
+}
 async function callAgentRetrying(c: AgentCall & { retryPrompt?: string }): Promise<AgentResult> {
   let r = await callAgent(c);
-  for (let i = 1; i <= RETRIES && !r.ok && !r.error?.startsWith("timed out"); i++) {
-    const delay = Number(process.env.DUET_RETRY_DELAY_SECONDS ?? 60);
-    log(c.run, `${c.agent} ${c.role} call failed (${r.error?.slice(0, 200)}); retry ${i}/${RETRIES} in ${delay}s`);
+  let retries = 0, waited = 0;
+  for (let n = 1; !r.ok && !r.error?.startsWith("timed out"); n++) {
+    const limited = LIMIT_RE.test(r.error ?? "");
+    if (limited ? waited >= LIMIT_MAX_WAIT_S : retries >= RETRIES) break;
+    const delay = limited ? limitDelay(r.error!) : Number(process.env.DUET_RETRY_DELAY_SECONDS ?? 60);
+    if (limited) waited += delay; else retries++;
+    log(c.run, limited
+      ? `${c.agent} ${c.role} hit a usage limit (${r.error?.slice(0, 200)}); waiting ${Math.round(delay / 60)} min, then retrying`
+      : `${c.agent} ${c.role} call failed (${r.error?.slice(0, 200)}); retry ${retries}/${RETRIES} in ${delay}s`);
     await Bun.sleep(delay * 1000);
-    r = await callAgent({ ...c, prompt: c.retryPrompt ?? c.prompt, jobDir: `${c.jobDir}-retry${i}` });
+    r = await callAgent({ ...c, prompt: c.retryPrompt ?? c.prompt, jobDir: `${c.jobDir}-retry${n}` });
   }
   return r;
 }

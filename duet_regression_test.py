@@ -31,6 +31,10 @@ if 'SANDBOX PROBE' in prompt:
         subprocess.run(['sh', re.search(r'sh (\S+probe\.sh)', prompt).group(1)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     reply({'status':'completed','summary':'probe','commits':[],'checks_run':[],'decision_requests':[],'deviations':[]})
     sys.exit(0)
+if scenario == 'usage-limit' and not review and p(sys.argv[0]).name == 'codex':
+    hits = log.with_name('limit-hits'); n = int(hits.read_text()) if hits.exists() else 0
+    if n < 3:
+        hits.write_text(str(n + 1)); print(json.dumps({'type':'turn.failed','error':{'message':"You've hit your usage limit. Try again later."}})); sys.exit(1)
 if scenario == 'slow-build' and not review and p.cwd().name != 'integration':
     import time; time.sleep(30)
 if scenario == 'review-crash-once' and review and p(sys.argv[0]).name == 'codex':
@@ -444,6 +448,15 @@ class DuetCliTests(unittest.TestCase):
 
     def gh_records(self):
         return [json.loads(line) for line in self.gh_calls.read_text().splitlines()]
+
+    def test_usage_limits_wait_instead_of_failing_the_ticket(self):
+        self.env['DUET_LIMIT_DELAY_SECONDS']='0'
+        self.start('usage-limit')
+        self.assertEqual(self.state['phase'],'done',self.last_output)
+        self.assertEqual((self.root/'limit-hits').read_text(),'3')
+        events=(self.run_path/'events.jsonl').read_text()
+        self.assertEqual(events.count('hit a usage limit'),3,events)
+        self.assertNotIn('retry 1/2',events)
 
     def test_plan_reads_a_github_spec_and_its_blocked_by_graph(self):
         spike=gh_issue(6,'Spike'); spike['labels']=[{'name':'ready-for-human'}]
