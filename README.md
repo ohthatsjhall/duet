@@ -23,8 +23,16 @@ with no human relaying between Claude Code and Codex.
 
 ## Flow
 
+The spec is local (`spec.md` + `issues/NN-slug.md`) or a GitHub issue whose sub-issues are the
+tickets (`--spec '#N'`, `owner/repo#N` or the issue URL). A GitHub spec is written out once, at
+start, as the same files under `runs/<id>/remote/`; that pinned copy is what the run builds, and a
+resume only warns if the issues changed. Ticket ids are issue numbers and blockers are GitHub's
+blocked-by links; closed sub-issues are done and open `ready-for-human` ones are not built. GitHub
+gets write-backs only: a `duet:in-progress|merged|failed|needs-decision` label, one comment per
+outcome, and `Closes owner/repo#N` lines in the PR.
+
     grill-with-docs → to-spec → to-tickets            (you + Claude, one context window)
-    duet start --spec <spec.md>                        (the supervisor, hands off)
+    duet start --spec <spec.md | #N>                   (the supervisor, hands off)
       per ticket, blockers first, N in parallel:
         builder: implement (tdd) → check → simplify → commit
         supervisor: runs the check command itself

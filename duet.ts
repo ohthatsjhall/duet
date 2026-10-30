@@ -21,9 +21,9 @@
  *   duet recover                         # resume runs interrupted by a reboot, hangup or crash
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync, readlinkSync, statSync, cpSync, rmSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, appendFileSync, readdirSync, readlinkSync, statSync, cpSync, rmSync, unlinkSync } from "node:fs";
 import { join, resolve, basename, dirname } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 
 // ───────────────────────────── paths & config ─────────────────────────────
 
@@ -136,6 +136,8 @@ interface Ticket {
   decisions: string[];   // decision ids raised by this ticket
   mergedSha?: string;
   note?: string;
+  remoteLabel?: string;           // GitHub tickets: the duet:* label last written to the issue
+  remoteReported?: TicketStatus;  // GitHub tickets: the outcome last commented on the issue
 }
 
 interface Decision { id: string; ticket: string; title: string; question: string; options: string[]; recommendation: string; answer?: string; raisedAt: string; answeredAt?: string; }
@@ -150,6 +152,7 @@ interface Run {
   specSnapshot: string;
   ticketsDir: string;
   inputsDir: string;
+  remote?: { repo: string; issue: number; hashes: Record<string, string> }; // spec read from a GitHub issue and its sub-issues
   builder: Agent;
   reviewer: Agent;
   base: string;
@@ -222,7 +225,7 @@ const git = (cwd: string, ...args: string[]) => sh(["git", ...args], { cwd });
 const gitTry = (cwd: string, ...args: string[]) => sh(["git", ...args], { cwd, allowFail: true });
 
 function runDir(run: Run) { return join(RUNS_DIR, run.id); }
-function save(run: Run) { run.updatedAt = now(); writeJson(join(runDir(run), "state.json"), run); }
+function save(run: Run) { run.updatedAt = now(); if (run.remote) syncRemote(run); writeJson(join(runDir(run), "state.json"), run); }
 function loadRun(id: string): Run {
   const p = join(RUNS_DIR, id, "state.json");
   if (!existsSync(p)) die(`no run named ${id} (see: duet runs)`);
@@ -299,6 +302,103 @@ function setStatusLine(file: string, status: string) {
     : body.replace(/\n/, `\n\n**Status:** ${status}\n`);
   writeFileSync(file, next);
 }
+// ───────────────────────────── GitHub specs ─────────────────────────────
+//
+// A spec can be a GitHub issue whose sub-issues are the tickets. It is read once, written out as
+// spec.md + issues/NN-slug.md (ticket id = issue number, blockers from GitHub's native blocked-by
+// links), and from then on the run reads that pinned copy like any local spec. GitHub only gets
+// write-backs: a duet:* label per ticket, one comment per outcome, and Closes lines in the PR.
+
+// `#2`, `github:#2`, `owner/repo#2` or an issue URL. A path that exists locally always wins.
+function parseRemoteSpec(spec: string): { repo?: string; issue: number } | undefined {
+  const m = spec.replace(/^github:/, "").match(/^(?:https:\/\/github\.com\/)?(?:([\w.-]+\/[\w.-]+)(?:#|\/issues\/))?#?(\d+)$/);
+  return m ? { repo: m[1], issue: Number(m[2]) } : undefined;
+}
+
+interface GhIssue { number: number; title: string; body: string | null; state: string; labels?: { name: string }[] }
+const ghList = async (cwd: string, path: string) =>
+  (JSON.parse((await sh(["gh", "api", "--paginate", "--slurp", path], { cwd })).out) as GhIssue[][]).flat();
+
+// shortcut: ticket ids are parsed as 1-3 digits, so issue numbers above 999 are unsupported; widen parseTicket then.
+async function materializeRemote(ref: { repo?: string; issue: number }, cwd: string, into: string) {
+  const repo = ref.repo ?? (await sh(["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"], { cwd })).out;
+  const spec = JSON.parse((await sh(["gh", "api", `repos/${repo}/issues/${ref.issue}`], { cwd })).out) as GhIssue;
+  const all = await ghList(cwd, `repos/${repo}/issues/${ref.issue}/sub_issues?per_page=100`);
+  // The triage vocabulary's "requires human implementation": left out, so anything it blocks is refused below.
+  const human = all.filter((s) => s.state === "open" && s.labels?.some((l) => l.name === "ready-for-human"));
+  const subs = all.filter((s) => !human.includes(s));
+  if (subs.length === 0) throw new Error(`${repo}#${ref.issue} has no sub-issues to build`);
+  const nums = new Set(subs.map((s) => s.number));
+  const dir = join(into, slugify(spec.title));
+  mkdirSync(join(dir, "issues"), { recursive: true });
+  const hashes: Record<string, string> = {};
+  const write = (file: string, key: string, text: string) => { writeFileSync(file, text); hashes[key] = Bun.hash(text).toString(36); };
+  write(join(dir, "spec.md"), "spec", `# ${spec.title}\n\n${spec.body ?? ""}\n`);
+  for (const s of subs) {
+    const blockers = await ghList(cwd, `repos/${repo}/issues/${s.number}/dependencies/blocked_by?per_page=100`);
+    const outside = blockers.filter((b) => !nums.has(b.number) && b.state === "open");
+    if (outside.length) throw new Error(`#${s.number} is blocked by open issues outside ${repo}#${ref.issue}: ${outside.map((b) => `#${b.number}`).join(", ")}`);
+    const id = String(s.number).padStart(2, "0");
+    const blockedBy = blockers.filter((b) => nums.has(b.number)).map((b) => `#${b.number}`).join(", ") || "None";
+    write(join(dir, "issues", `${id}-${slugify(s.title)}.md`), id,
+      `# ${s.title}\n\n**Blocked by:** ${blockedBy}\n\n**Status:** ${s.state === "closed" ? "done" : "ready-for-agent"}\n\n${s.body ?? ""}\n`);
+  }
+  return { specPath: join(dir, "spec.md"), remote: { repo, issue: ref.issue, hashes }, human };
+}
+
+// Coarse on purpose: the issue shows where a ticket is; state.json keeps the detail.
+function remoteLabel(s: TicketStatus): string | undefined {
+  if (s === "merged" || s === "failed") return `duet:${s}`;
+  if (s === "needs_decision") return "duet:needs-decision";
+  if (["building", "checking", "reviewing", "fixing", "approved", "merging"].includes(s)) return "duet:in-progress";
+}
+
+let remoteWrites: Promise<unknown> = Promise.resolve();
+const madeLabels = new Set<string>();
+function enqueueRemote(run: Run, fn: () => Promise<unknown>) {
+  // GitHub being down or rate-limited must never stop a build.
+  remoteWrites = remoteWrites.then(fn).catch((e) => log(run, `github write-back failed: ${String(e).slice(0, 300)}`));
+}
+function syncRemote(run: Run) {
+  const repo = run.remote!.repo;
+  for (const t of Object.values(run.tickets)) {
+    const issue = String(t.num);
+    const label = remoteLabel(t.status);
+    if (label !== t.remoteLabel) {
+      const prev = t.remoteLabel;
+      t.remoteLabel = label;
+      enqueueRemote(run, async () => {
+        if (label && !madeLabels.has(label)) { await sh(["gh", "label", "create", label, "--repo", repo, "--force", "--color", "5319e7"]); madeLabels.add(label); }
+        await sh(["gh", "issue", "edit", issue, "--repo", repo, ...(prev ? ["--remove-label", prev] : []), ...(label ? ["--add-label", label] : [])]);
+      });
+    }
+    if ((t.status === "merged" || t.status === "failed") && t.remoteReported !== t.status) {
+      t.remoteReported = t.status;
+      const { builder, reviewer } = rolesFor(run, t);
+      const r = t.lastReview;
+      const body = t.status === "merged"
+        ? `duet run \`${run.id}\`: merged into \`${run.branch}\` as ${short(t.mergedSha)}. Built by ${builder}, reviewed by ${reviewer}.${r ? `\n\nReview (${r.verdict}): ${r.summary}${r.findings.length ? `\n\nFindings${t.carriedReview ? " carried to the final review" : ""}: ${findingsAsText(r.findings)}` : ""}` : ""}`
+        : `duet run \`${run.id}\`: failed. ${t.note ?? "See the run's events log."}`;
+      enqueueRemote(run, () => sh(["gh", "issue", "comment", issue, "--repo", repo, "--body", body]));
+    }
+  }
+}
+
+// Warns, never re-plans: a run builds the copy it started with.
+async function warnRemoteDrift(run: Run) {
+  const r = run.remote!;
+  const tmp = mkdtempSync(join(tmpdir(), "duet-remote-"));
+  try {
+    const current = (await materializeRemote(r, run.repo, tmp)).remote.hashes;
+    const changed = [...new Set([...Object.keys(r.hashes), ...Object.keys(current)])].filter((k) => r.hashes[k] !== current[k]);
+    if (changed.length) log(run, `warning: ${r.repo}#${r.issue} changed on GitHub since this run started (${changed.join(", ")}); this run keeps building its pinned copy. Start a new run to pick the changes up.`);
+  } catch (e) {
+    log(run, `could not check ${r.repo}#${r.issue} for changes: ${String(e).slice(0, 200)}`);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 function findingsAsText(findings: Finding[]) {
   if (findings.length === 0) return "(no findings)";
   return findings.map((f) => `${f.id} [${f.severity}${f.axis ? "/" + f.axis : ""}] ${f.path}: ${f.evidence} → ${f.fix}`).join("; ");
@@ -1211,7 +1311,9 @@ async function runFinalPhase(run: Run) {
         const p = await gitTry(iw, "push", "-u", "origin", run.branch);
         log(run, p.code === 0 ? `pushed ${run.branch}` : `push failed: ${p.err.slice(-300)}`);
         if (run.pr && p.code === 0) {
-          const body = `Implements ${basename(dirname(run.spec))} spec.\n\nBuilt by ${run.builder}, reviewed by ${run.reviewer} (duet run ${run.id}).\n\nTickets: ${Object.values(run.tickets).map((t) => `${t.id} ${t.title}`).join("; ")}`;
+          // Tickets close when this PR reaches the default branch, not when they land on the integration branch.
+          const closes = run.remote ? `\n\n${Object.values(run.tickets).filter((t) => t.status === "merged").map((t) => `Closes ${run.remote!.repo}#${t.num}`).join("\n")}` : "";
+          const body = `Implements ${basename(dirname(run.spec))} spec.\n\nBuilt by ${run.builder}, reviewed by ${run.reviewer} (duet run ${run.id}).\n\nTickets: ${Object.values(run.tickets).map((t) => `${t.id} ${t.title}`).join("; ")}${closes}`;
           const pr = await sh(["gh", "pr", "create", "--draft", "--title", `${basename(dirname(run.spec))}: ${Object.keys(run.tickets).length} tickets`, "--body", body], { cwd: iw, allowFail: true });
           log(run, pr.code === 0 ? `draft PR: ${pr.out}` : `gh pr create failed: ${pr.err.slice(-300)}`);
         }
@@ -1358,10 +1460,14 @@ function parseArgs(argv: string[]) {
 }
 
 async function cmdStart(flags: Record<string, string | boolean>, dryRun = false) {
-  const specPath = flags.spec ? resolve(String(flags.spec)) : die("--spec <path/to/spec.md> is required");
-  if (!existsSync(specPath)) die(`spec not found: ${specPath}`);
-  const ticketsDir = flags.tickets ? resolve(String(flags.tickets)) : join(dirname(specPath), "issues");
+  const specArg = flags.spec ? String(flags.spec) : die("--spec <path/to/spec.md | #N | owner/repo#N> is required");
   const repo = (await sh(["git", "rev-parse", "--show-toplevel"], { cwd: flags.repo ? resolve(String(flags.repo)) : process.cwd() })).out;
+  const remoteRef = existsSync(resolve(specArg)) ? undefined : parseRemoteSpec(specArg);
+  const tmp = remoteRef ? mkdtempSync(join(tmpdir(), "duet-remote-")) : undefined;
+  const fetched = remoteRef ? await materializeRemote(remoteRef, repo, tmp!).catch((e) => die(`could not read ${specArg} from GitHub: ${(e as Error).message}`)) : undefined;
+  let specPath = fetched ? fetched.specPath : resolve(specArg);
+  if (!existsSync(specPath)) die(`spec not found: ${specPath}`);
+  let ticketsDir = !fetched && flags.tickets ? resolve(String(flags.tickets)) : join(dirname(specPath), "issues");
   const gitCommonDir = resolve(repo, (await git(repo, "rev-parse", "--git-common-dir")).out);
   const repoCfg = readJson<RepoConfig>(join(repo, ".duet.json"), {});
   const globalCfg = readJson<GlobalConfig>(GLOBAL_CONFIG, {});
@@ -1397,16 +1503,25 @@ async function cmdStart(flags: Record<string, string | boolean>, dryRun = false)
   const checkFinal = (flags["check-final"] as string) ?? repoCfg.checkFinal;
   if (checkFinal) console.log(`  final     ${check} && ${checkFinal}`);
   console.log(`  parallel  ${flags.parallel ?? repoCfg.parallel ?? 1}`);
-  console.log(`  tickets   ${tickets.length} in ${ticketsDir}`);
+  console.log(`  tickets   ${tickets.length} in ${fetched ? `${fetched.remote.repo}#${fetched.remote.issue} (GitHub sub-issues)` : ticketsDir}`);
+  for (const h of fetched?.human ?? []) console.log(`    #${h.number} ${h.title}  (ready-for-human: not built)`);
   for (const t of tickets) console.log(`    ${t.id} ${t.status === "skipped" ? "(done) " : ""}${t.title}${t.builder ? `  [builder: ${t.builder}]` : ""}${t.blockedBy.length ? `  ← blocked by ${t.blockedBy.join(", ")}` : ""}`);
   const frontier = tickets.filter((t) => t.status === "pending" && t.blockedBy.every((b) => tickets.find((x) => x.id === b)!.status === "skipped"));
   console.log(`  frontier  ${frontier.map((t) => t.id).join(", ") || "(none)"}\n`);
-  if (dryRun) return;
+  if (dryRun) { if (tmp) rmSync(tmp, { recursive: true, force: true }); return; }
 
   if ((await gitTry(repo, "status", "--porcelain", "--untracked-files=no")).out) console.log("  note: the main checkout has uncommitted changes; duet only reads it and works in separate worktrees.\n");
 
   const dir = join(RUNS_DIR, id);
   const inputsDir = join(dir, "inputs");
+  if (fetched) {
+    // The pinned copy is the run's ticket source: status lines and comments land here, write-backs go to GitHub.
+    const pinned = join(dir, "remote", basename(dirname(specPath)));
+    cpSync(dirname(specPath), pinned, { recursive: true });
+    rmSync(tmp!, { recursive: true, force: true });
+    specPath = join(pinned, "spec.md"); ticketsDir = join(pinned, "issues");
+    for (const t of tickets) t.source = join(ticketsDir, basename(t.source));
+  }
   mkdirSync(join(inputsDir, "issues"), { recursive: true });
   mkdirSync(join(dir, "decisions"), { recursive: true });
   cpSync(specPath, join(inputsDir, "spec.md"));
@@ -1418,7 +1533,7 @@ async function cmdStart(flags: Record<string, string | boolean>, dryRun = false)
   await git(repo, "worktree", "add", "-b", branch, integrationWorktree, baseSha);
 
   const run: Run = {
-    id, createdAt: now(), updatedAt: now(), repo, gitCommonDir, spec: specPath, specSnapshot: join(inputsDir, "spec.md"), ticketsDir, inputsDir,
+    id, createdAt: now(), updatedAt: now(), repo, gitCommonDir, spec: specPath, specSnapshot: join(inputsDir, "spec.md"), ticketsDir, inputsDir, remote: fetched?.remote,
     builder, reviewer, base, baseSha, branch, integrationWorktree, integrationHead: baseSha,
     check, checkAfterMerge: repoCfg.checkAfterMerge ?? true, checkFinal: (flags["check-final"] as string) ?? repoCfg.checkFinal,
     writableDirs: (repoCfg.writableDirs ?? []).map(expandHome), codexSandbox: repoCfg.codexSandbox,
@@ -1468,6 +1583,7 @@ async function cmdResume(id: string, auto = false) {
   if (cfg.artifacts) run.artifacts = cfg.artifacts;
   if (cfg.worktreeFiles) run.worktreeFiles = cfg.worktreeFiles;
   if (String(process.argv).includes("--allow-red-baseline")) run.allowRedBaseline = true;
+  if (run.remote) await warnRemoteDrift(run);
   if (!auto) run.recoveries = 0;
   run.interrupted = undefined;
   // tickets interrupted mid-flight go back to pending; their worktrees are kept and the builder is told to continue
@@ -1722,10 +1838,13 @@ async function main() {
     default:
       console.log(`duet — two-agent build supervisor
 
-  duet start  --spec <spec.md> [--tickets <dir>] [--builder claude|codex] [--reviewer claude|codex]
+  duet start  --spec <spec.md | #N | owner/repo#N> [--tickets <dir>] [--builder claude|codex] [--reviewer claude|codex]
               [--base <ref>] [--check "<cmd>"] [--parallel N] [--timeout <min>] [--push] [--pr]
               [--claude-model <m>] [--codex-model <m>]
-  duet plan   --spec <spec.md>            parse the ticket graph and print the plan; run nothing
+  duet plan   --spec <spec.md | #N>       parse the ticket graph and print the plan; run nothing
+
+A GitHub spec is an issue whose sub-issues are the tickets (blockers from native blocked-by links).
+It is pinned at start; duet labels each issue duet:*, comments each outcome, and the PR closes them.
   duet resume <run-id> [--retry-failed] [--allow-red-baseline]
                                           continue after a stop, a crash, or an answered decision
   duet recover                             resume runs interrupted by a reboot, hangup or crash (run by the duet-recover timer)
@@ -1749,7 +1868,7 @@ function latestRunId(): string {
   return ids.pop() ?? die("no runs yet");
 }
 
-main().catch((e) => {
+main().then(() => remoteWrites).catch((e) => {
   console.error(`duet: ${(e as Error).stack ?? e}`);
   if (driving && (driving.phase === "tickets" || driving.phase === "final")) { driving.interrupted = "crash"; save(driving); log(driving, `supervisor crashed: ${(e as Error).message}`); }
   process.exit(1);

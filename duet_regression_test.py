@@ -108,6 +108,21 @@ else:
     print(json.dumps({'subtype':'success','is_error':False,'structured_output':result}))
 '''
 
+FAKE_GH = r'''#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ['DUET_TEST_GH_CALLS'], 'a') as f: f.write(json.dumps(args) + '\n')
+if args[:2] == ['repo', 'view']: print('acme/widgets'); sys.exit(0)
+if args[0] == 'api':
+    path = [a for a in args[1:] if not a.startswith('--')][0].split('?')[0]
+    data = json.loads(open(os.environ['DUET_TEST_GH']).read()).get(path, [])
+    print(json.dumps([data] if '--slurp' in args else data)); sys.exit(0)
+if args[:2] == ['pr', 'create']: print('https://github.com/acme/widgets/pull/9')
+'''
+
+def gh_issue(number, title, body='', state='open'):
+    return {'number':number, 'title':title, 'body':body, 'state':state}
+
 class DuetCliTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='duet-cli-regression-', dir='/tmp')
@@ -418,6 +433,61 @@ class DuetCliTests(unittest.TestCase):
         self.assertIn('models    claude=claude-opus-5[1m]',result.stdout)
         self.assertIn('codex=gpt-5.6-sol',result.stdout)
         self.assertIn('reviews   tickets=carry-to-final    final=blocking',result.stdout)
+
+    def github_spec(self, subs, blockers):
+        gh=self.bin/'gh'; gh.write_text(FAKE_GH); gh.chmod(0o755)
+        self.gh_calls=self.root/'gh-calls.jsonl'; self.env['DUET_TEST_GH_CALLS']=str(self.gh_calls)
+        fixtures={'repos/acme/widgets/issues/2':gh_issue(2,'Widget API','The spec body.'),
+                  'repos/acme/widgets/issues/2/sub_issues':subs}
+        for n,bs in blockers.items(): fixtures[f'repos/acme/widgets/issues/{n}/dependencies/blocked_by']=bs
+        (self.root/'gh.json').write_text(json.dumps(fixtures)); self.env['DUET_TEST_GH']=str(self.root/'gh.json')
+
+    def gh_records(self):
+        return [json.loads(line) for line in self.gh_calls.read_text().splitlines()]
+
+    def test_plan_reads_a_github_spec_and_its_blocked_by_graph(self):
+        spike=gh_issue(6,'Spike'); spike['labels']=[{'name':'ready-for-human'}]
+        self.github_spec([gh_issue(3,'Tooling'),gh_issue(4,'Markets'),gh_issue(5,'Done already',state='closed'),spike],
+                         {4:[gh_issue(3,'Tooling'),gh_issue(1,'Old closed blocker',state='closed')]})
+        result=self.cli('plan','--spec','#2','--check','true')
+        self.assertEqual(result.returncode,0,self.last_output)
+        self.assertIn('acme/widgets#2 (GitHub sub-issues)',result.stdout)
+        self.assertIn('04 Markets  ← blocked by 03',result.stdout)
+        self.assertIn('05 (done) Done already',result.stdout)
+        self.assertIn('frontier  03\n',result.stdout)
+        self.assertIn('#6 Spike  (ready-for-human: not built)',result.stdout)
+        self.assertNotIn('06 Spike',result.stdout)
+        self.assertFalse(list((self.home/'runs').glob('*')), 'plan must not create a run')
+
+    def test_plan_refuses_a_ticket_blocked_by_an_open_issue_outside_the_spec(self):
+        self.github_spec([gh_issue(3,'Tooling')],{3:[gh_issue(40,'Elsewhere')]})
+        result=self.cli('plan','--spec','acme/widgets#2','--check','true')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('#3 is blocked by open issues outside acme/widgets#2: #40',self.last_output)
+
+    def test_a_github_spec_is_pinned_labelled_commented_and_closed_by_the_pr(self):
+        self.github_spec([gh_issue(3,'Implement behavior','- [ ] behavior.txt contains implemented.')],{})
+        origin=self.root/'origin.git'
+        subprocess.run(['git','init','-q','--bare',str(origin)],check=True,env=self.env)
+        self.git('remote','add','origin',str(origin))
+        (self.repo/'.duet.json').write_text(json.dumps({'check':'true','parallel':1,'push':True,'pr':True}))
+        self.cli('start','--spec','#2','--builder','codex')
+        state=json.loads(next((self.home/'runs').glob('*/state.json')).read_text())
+        self.assertEqual(state['phase'],'done',self.last_output)
+        self.assertEqual(state['remote']['repo'],'acme/widgets')
+        pinned=Path(state['tickets']['03']['source'])
+        self.assertTrue(str(pinned).startswith(str(self.home/'runs')),pinned)
+        self.assertIn('done (duet:',pinned.read_text())
+        calls=self.gh_records()
+        edits=[c for c in calls if c[:2]==['issue','edit']]
+        self.assertEqual(edits[0],['issue','edit','3','--repo','acme/widgets','--add-label','duet:in-progress'])
+        self.assertEqual(edits[-1],['issue','edit','3','--repo','acme/widgets','--remove-label','duet:in-progress','--add-label','duet:merged'])
+        comments=[c for c in calls if c[:2]==['issue','comment']]
+        self.assertEqual(len(comments),1,comments)
+        self.assertIn('merged into',comments[0][-1])
+        pr=[c for c in calls if c[:2]==['pr','create']]
+        self.assertEqual(len(pr),1,self.last_output)
+        self.assertIn('Closes acme/widgets#3',pr[0][pr[0].index('--body')+1])
 
     def test_teardown_removes_derived_state_but_preserves_branch_and_audit(self):
         self.start()
