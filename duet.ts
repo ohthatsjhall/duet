@@ -56,6 +56,7 @@ interface RepoConfig {
   artifacts?: string[];       // worktree-relative paths to keep when a ticket's worktree is removed: screenshots, reports
   worktreeFiles?: string[];   // gitignored files copied from the main checkout into every worktree: the local env an app needs to boot for browser verification
   jevDisputeThreshold?: number; // Jev `blocks` probability above which a medium/low finding is recorded as disputed (default 0.8); needs TYPESAFE_API_KEY
+  pauseBeforeFinal?: boolean; // stop after the last ticket merges, before reconcile/simplify/final review
 }
 
 interface GlobalConfig {
@@ -175,6 +176,7 @@ interface Run {
   codexModel?: string;
   extraInstructions?: string;
   ticketReviewPolicy?: TicketReviewPolicy; // optional for compatibility with runs created before this field existed
+  pauseBeforeFinal?: boolean;  // stop once every ticket is in, so the owner can triage carried findings
   phase: "tickets" | "final" | "done" | "stopped";
   finalStep: "reconcile" | "simplify" | "check" | "review" | "fix" | "publish" | "done";
   finalRound: number;
@@ -1211,6 +1213,7 @@ async function runTicketsPhase(run: Run) {
     if (done) {
       run.phase = "final";
       run.finalStep = carriedReviewContext(run, true).length ? "reconcile" : "simplify";
+      if (run.pauseBeforeFinal) { run.phase = "stopped"; run.stopReason = "paused before the final phase (pauseBeforeFinal): triage carried findings, then resume"; }
       save(run); return;
     }
     const next = ready(run).filter((t) => !inflight.has(t.id)).slice(0, Math.max(0, run.parallel - inflight.size));
@@ -1555,7 +1558,7 @@ async function cmdStart(flags: Record<string, string | boolean>, dryRun = false)
     parallel: Number(flags.parallel ?? repoCfg.parallel ?? 1), timeoutMinutes: Number(flags.timeout ?? repoCfg.timeoutMinutes ?? globalCfg.timeoutMinutes ?? 45),
     push: Boolean(flags.push ?? repoCfg.push ?? false), pr: Boolean(flags.pr ?? repoCfg.pr ?? false),
     claudeModel, codexModel, allowRedBaseline: flags["allow-red-baseline"] === true || undefined,
-    extraInstructions: repoCfg.extraInstructions, ticketReviewPolicy: reviewPolicy,
+    extraInstructions: repoCfg.extraInstructions, ticketReviewPolicy: reviewPolicy, pauseBeforeFinal: repoCfg.pauseBeforeFinal,
     phase: "tickets", finalStep: "simplify", finalRound: 0, tickets: Object.fromEntries(tickets.map((t) => [t.id, t])), decisions: {}, maxRounds: repoCfg.maxRounds ?? MAX_ROUNDS, jevDisputeThreshold: repoCfg.jevDisputeThreshold,
   };
   save(run);
@@ -1606,6 +1609,7 @@ async function cmdResume(id: string, auto = false) {
   if (cfg.jevDisputeThreshold !== undefined) run.jevDisputeThreshold = cfg.jevDisputeThreshold;
   if (cfg.artifacts) run.artifacts = cfg.artifacts;
   if (cfg.worktreeFiles) run.worktreeFiles = cfg.worktreeFiles;
+  if (cfg.pauseBeforeFinal !== undefined) run.pauseBeforeFinal = cfg.pauseBeforeFinal;
   if (String(process.argv).includes("--allow-red-baseline")) run.allowRedBaseline = true;
   if (run.remote) await warnRemoteDrift(run);
   if (!auto) run.recoveries = 0;

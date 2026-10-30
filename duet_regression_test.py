@@ -599,6 +599,16 @@ class DuetCliTests(unittest.TestCase):
         self.assertIn('not a decision',self.state['stopReason'])
         self.assertIn('index.lock',self.state['stopReason'])
 
+    def test_pause_before_final_stops_after_the_last_ticket_then_resumes_into_it(self):
+        self.start(pauseBeforeFinal=True)
+        self.assertEqual(self.state['phase'],'stopped',self.last_output)
+        self.assertIn('paused before the final phase',self.state['stopReason'])
+        self.assertEqual(self.state['tickets']['01']['status'],'merged')
+        self.assertFalse(any(r['final'] for r in self.records()),'the final phase ran before the pause')
+        self.cli('resume',self.state['id'])
+        state=json.loads((self.run_path/'state.json').read_text())
+        self.assertEqual(state['phase'],'done',self.last_output)
+
     def test_an_owner_finding_on_a_merged_ticket_reaches_final_reconciliation(self):
         (self.feature/'issues/02-env.md').write_text('# 02: Env\n\n**Blocked by:** None\n\n**Status:** ready-for-agent\n\n- [ ] env.\n')
         self.start('environment-blocked-02')
