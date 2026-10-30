@@ -14,6 +14,7 @@ Roles are fixed per run and alternate between runs. Whoever builds never grades.
 1. Find the spec. It is either local or on GitHub:
    - **Local:** a `spec.md` with a tickets directory next to it (`issues/NN-slug.md`, Pocock format with `**Blocked by:**` and `**Status:**` lines). If there is none, run `/to-tickets` first.
    - **GitHub:** pass the spec issue as `--spec '#N'` (or `owner/repo#N`, or its URL). Its sub-issues are the tickets, each ticket's id is its issue number, and blockers come from GitHub's native blocked-by links. Closed sub-issues count as done; open ones labelled `ready-for-human` are not built. Duet pins a copy at start and warns (never re-plans) if the issues change mid-run. It writes back a `duet:*` label per ticket, one comment per outcome, and `Closes owner/repo#N` lines in the PR, so tickets close when the PR reaches the default branch.
+   - **GitHub, but the run holds no GitHub credentials:** `duet pull --spec '#N' --out <dir>` with the owner's login, then start the run from `<dir>/<slug>/spec.md` as a local spec. No write-backs; the integration branch and PR (with `Closes owner/repo#N` lines) are pushed afterwards by someone with access.
 2. Show the plan without running anything:
 
        duet plan --spec <spec.md>

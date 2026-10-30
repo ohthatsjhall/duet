@@ -31,6 +31,10 @@ blocked-by links; closed sub-issues are done and open `ready-for-human` ones are
 gets write-backs only: a `duet:in-progress|merged|failed|needs-decision` label, one comment per
 outcome, and `Closes owner/repo#N` lines in the PR.
 
+When the run itself must hold no GitHub credentials (builders run as an unprivileged user), fetch
+with your own login instead: `duet pull --spec '#N' --out <dir>` writes the same local files, and the
+run starts from `<dir>/<slug>/spec.md` with no write-backs. Ticket files keep the issue numbers.
+
     grill-with-docs → to-spec → to-tickets            (you + Claude, one context window)
     duet start --spec <spec.md | #N>                   (the supervisor, hands off)
       per ticket, blockers first, N in parallel:

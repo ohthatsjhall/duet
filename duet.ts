@@ -1550,6 +1550,16 @@ async function cmdStart(flags: Record<string, string | boolean>, dryRun = false)
   await drive(run);
 }
 
+// For runs that must not hold GitHub credentials: fetch with your own login, then start from the files.
+async function cmdPull(flags: Record<string, string | boolean>) {
+  const spec = flags.spec ? String(flags.spec) : die("usage: duet pull --spec <#N | owner/repo#N> --out <dir>");
+  const ref = parseRemoteSpec(spec) ?? die(`not a GitHub issue reference: ${spec}`);
+  const out = flags.out ? resolve(String(flags.out)) : die("missing --out <dir>");
+  const { specPath, human } = await materializeRemote(ref, process.cwd(), out).catch((e) => die(`could not read ${spec} from GitHub: ${(e as Error).message}`));
+  console.log(`${specPath}  (${readdirSync(join(dirname(specPath), "issues")).length} tickets)`);
+  for (const h of human) console.log(`  not pulled: #${h.number} ${h.title} (ready-for-human)`);
+}
+
 function other(a: Agent): Agent { return a === "claude" ? "codex" : "claude"; }
 function rolesFor(run: Run, t: Ticket): { builder: Agent; reviewer: Agent } {
   const builder = t.builder ?? run.builder;
@@ -1826,6 +1836,7 @@ async function main() {
   switch (cmd) {
     case "start": return cmdStart(flags);
     case "plan": return cmdStart(flags, true);
+    case "pull": return cmdPull(flags);
     case "resume": return cmdResume(pos[0] ?? die("usage: duet resume <run-id> [--retry-failed]"));
     case "status": return printStatus(loadRun(pos[0] ?? (typeof flags.quick === "string" ? flags.quick : latestRunId())), Boolean(flags.quick));
     case "answer": return cmdAnswer(pos[0] ?? die("usage: duet answer <run-id> <decision-id> \"<answer>\""), pos[1] ?? die("missing decision id"), pos.slice(2).join(" ") || die("missing answer text"));
@@ -1845,6 +1856,7 @@ async function main() {
 
 A GitHub spec is an issue whose sub-issues are the tickets (blockers from native blocked-by links).
 It is pinned at start; duet labels each issue duet:*, comments each outcome, and the PR closes them.
+  duet pull   --spec <#N> --out <dir>      write a GitHub spec and its tickets as local files; start from those
   duet resume <run-id> [--retry-failed] [--allow-red-baseline]
                                           continue after a stop, a crash, or an answered decision
   duet recover                             resume runs interrupted by a reboot, hangup or crash (run by the duet-recover timer)

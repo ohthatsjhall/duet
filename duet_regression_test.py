@@ -465,6 +465,19 @@ class DuetCliTests(unittest.TestCase):
         self.assertNotEqual(result.returncode,0)
         self.assertIn('#3 is blocked by open issues outside acme/widgets#2: #40',self.last_output)
 
+    def test_pull_writes_a_github_spec_that_plans_like_a_local_one(self):
+        self.github_spec([gh_issue(3,'Tooling'),gh_issue(4,'Markets')],{4:[gh_issue(3,'Tooling')]})
+        out=self.root/'pulled'
+        result=self.cli('pull','--spec','#2','--out',str(out))
+        self.assertEqual(result.returncode,0,self.last_output)
+        spec=out/'widget-api'/'spec.md'
+        self.assertTrue(spec.exists(),self.last_output)
+        calls_before=len(self.gh_records())
+        plan=self.cli('plan','--spec',str(spec),'--check','true')
+        self.assertEqual(plan.returncode,0,self.last_output)
+        self.assertIn('04 Markets  ← blocked by 03',plan.stdout)
+        self.assertEqual(len(self.gh_records()),calls_before,'a pulled spec must not touch GitHub')
+
     def test_a_github_spec_is_pinned_labelled_commented_and_closed_by_the_pr(self):
         self.github_spec([gh_issue(3,'Implement behavior','- [ ] behavior.txt contains implemented.')],{})
         origin=self.root/'origin.git'
