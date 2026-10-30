@@ -1212,7 +1212,7 @@ async function runFinalPhase(run: Run) {
         log(run, p.code === 0 ? `pushed ${run.branch}` : `push failed: ${p.err.slice(-300)}`);
         if (run.pr && p.code === 0) {
           const body = `Implements ${basename(dirname(run.spec))} spec.\n\nBuilt by ${run.builder}, reviewed by ${run.reviewer} (duet run ${run.id}).\n\nTickets: ${Object.values(run.tickets).map((t) => `${t.id} ${t.title}`).join("; ")}`;
-          const pr = await gitTry(iw, "gh", "pr", "create", "--draft", "--title", `${basename(dirname(run.spec))}: ${Object.keys(run.tickets).length} tickets`, "--body", body);
+          const pr = await sh(["gh", "pr", "create", "--draft", "--title", `${basename(dirname(run.spec))}: ${Object.keys(run.tickets).length} tickets`, "--body", body], { cwd: iw, allowFail: true });
           log(run, pr.code === 0 ? `draft PR: ${pr.out}` : `gh pr create failed: ${pr.err.slice(-300)}`);
         }
       }
