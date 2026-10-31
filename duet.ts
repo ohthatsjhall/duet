@@ -601,6 +601,7 @@ function reviewPrompt(run: Run, opts: { ticket?: Ticket; baseSha: string; headSh
     ? `You are reviewing the WHOLE integrated feature branch \`${run.branch}\` against its base. Spec: ${run.specSnapshot}. Tickets directory (frozen copies): ${join(run.inputsDir, "issues")}. Emphasise interactions between tickets, missing user stories, and assumptions that per-ticket reviews would miss.${carried.length ? `\n\nPER-TICKET REVIEW ITEMS CARRIED TO THIS AUTHORITATIVE GATE:\n${JSON.stringify(carried, null, 2)}\nIndependently re-evaluate every carried critical/high finding against the final tree. In \`coverage\`, state which carried item was resolved or why it is not a defect; return it as a finding if it remains. Treat carried medium/low findings as context, not mandatory work.` : ""}`
     : `You are reviewing ONE ticket's implementation.\nTicket: ${opts.ticket!.snapshot}\nSpec: ${run.specSnapshot}`;
   return `You are the INDEPENDENT REVIEWER. You did not write this code. You cannot edit files, and you must not try to.
+Shell: you may run read-only git (diff, log, show, status, ls-files, blame, also with -C <dir> or --no-pager) and cat, rg, grep, ls, wc, head and tail, from your working directory (use the Read tool for line ranges). Run one command per call, with no for-loops or cd chains. A refused call refuses that command only, not the shell: retry it as a single allowed command. Tell every sub-agent you start the same.
 
 ${scope}
 
@@ -732,7 +733,7 @@ async function callAgent(c: AgentCall): Promise<AgentResult> {
       const readOnlyGit = ["diff", "log", "show", "status", "ls-files", "blame"].flatMap((s) =>
         [`Bash(git ${s}:*)`, `Bash(git -C * ${s} *)`, `Bash(git --no-pager ${s} *)`, `Bash(git -C * --no-pager ${s} *)`, `Bash(git --no-pager -C * ${s} *)`]);
       cmd.push("--permission-mode", "dontAsk",
-        "--allowedTools", "Read", "Glob", "Grep", "LS", "Skill", "Agent", ...readOnlyGit, "Bash(cat:*)", "Bash(rg:*)", "Bash(grep:*)",
+        "--allowedTools", "Read", "Glob", "Grep", "LS", "Skill", "Agent", ...readOnlyGit, "Bash(cat:*)", "Bash(rg:*)", "Bash(grep:*)", "Bash(ls:*)", "Bash(wc:*)", "Bash(head:*)", "Bash(tail:*)",
         "--disallowedTools", "Edit", "Write", "MultiEdit", "NotebookEdit",
         "--add-dir", c.run.inputsDir);
     }

@@ -465,6 +465,11 @@ class DuetCliTests(unittest.TestCase):
             self.assertIn(rule, review)
         self.assertFalse([a for a in review if a.startswith('Bash(git -C') and not any(f' {s} ' in a for s in ('diff','log','show','status','ls-files','blame'))], review)
         self.assertNotIn('Bash(git commit:*)', review)
+        for rule in ('Bash(ls:*)','Bash(wc:*)','Bash(head:*)','Bash(tail:*)'): self.assertIn(rule, review)
+        self.assertFalse([a for a in review if a.startswith('Bash(sed')], review)
+        self.assertNotIn('Bash(find:*)', review)
+        prompt=[r for r in self.records() if r['review']][0]['prompt']
+        self.assertIn('A refused call refuses that command only', prompt)
 
     def test_plan_reads_a_github_spec_and_its_blocked_by_graph(self):
         spike=gh_issue(6,'Spike'); spike['labels']=[{'name':'ready-for-human'}]
